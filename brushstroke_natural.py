@@ -22,6 +22,7 @@ from collections import defaultdict
 from math import comb as math_comb
 import datetime
 import random
+import time
 from sklearn.cluster import KMeans
 
 # ----------------------------
@@ -213,7 +214,7 @@ def mix_physically(base_rgb, blend_rgb, ratio):
 def paint_oil_pixel(canvas, x, y,
                     dryness_map, thickness_map,
                     carried_color, brush_color,
-                    pickup_ratio=0.3, deposit_factor=0.7):
+                    pickup_ratio=0.3, deposit_factor=0.7, glazing_factor=1.0):
     """
     - dryness_map[y, x] -> dryness in [0..1], 1=fully dry
     - thickness_map[y, x] -> how much paint has built up
@@ -232,7 +233,7 @@ def paint_oil_pixel(canvas, x, y,
     new_carried = mix_physically(carried_color, existing_rgb, pick)
 
     # Deposit
-    deposit = deposit_factor + (0.3 * wet_factor)
+    deposit = (deposit_factor + (0.3 * wet_factor)) * glazing_factor
     out_color = mix_physically(existing_rgb, new_carried, deposit)
 
     # thickness grows
@@ -333,7 +334,8 @@ def generate_stroke_dryness(
     brush_texture, brush_color,
     stroke_size,
     carried_color_dict,
-    water_alpha=0.3
+    water_alpha=0.3,
+    glazing_factor=1.0
 ):
     """
     A dryness-based stroke generator that calls paint_oil_pixel or paint_water_pixel.
@@ -351,7 +353,8 @@ def generate_stroke_dryness(
     steps = max(abs(dx), abs(dy)) or 1
 
     for i in range(steps+1):
-        t = i / float(steps)
+        t_linear = i / float(steps)
+        t = ease_in_out(t_linear)
         x_pt = int(start_pos[0] + t*dx)
         y_pt = int(start_pos[1] + t*dy)
 
@@ -367,20 +370,21 @@ def generate_stroke_dryness(
                             carried_color = paint_oil_pixel(
                                 canvas, xx, yy,
                                 dryness_map, thickness_map,
-                                carried_color, brush_color
+                                carried_color, brush_color,
+                                glazing_factor=glazing_factor
                             )
                         elif brush_texture.lower() == 'watercolor':
                             paint_water_pixel(
                                 canvas, xx, yy,
                                 dryness_map, brush_color,
-                                alpha_val=water_alpha
+                                alpha_val=water_alpha * glazing_factor
                             )
                         else:
                             # fallback to alpha blend (like “watercolor” for unknown brush)
                             paint_water_pixel(
                                 canvas, xx, yy,
                                 dryness_map, brush_color,
-                                alpha_val=0.1
+                                alpha_val=0.1 * glazing_factor
                             )
 
     carried_color_dict['stroke_carried_color'] = carried_color
@@ -389,11 +393,17 @@ def generate_stroke_dryness(
 # ----------------------------
 # New Functions: bezier_curve and generate_stroke
 # ----------------------------
+def ease_in_out(t):
+    """A simple ease-in-out function for non-linear interpolation."""
+    return t * t * (3.0 - 2.0 * t)
+
+
 def bezier_curve(points, num_steps):
     """Compute points along a Bézier curve defined by control points."""
     n = len(points) - 1
     curve = []
-    for t in np.linspace(0, 1, num_steps):
+    for t_linear in np.linspace(0, 1, num_steps):
+        t = ease_in_out(t_linear)
         point = np.zeros(2)
         for i, p in enumerate(points):
             bernstein_poly = math_comb(n, i) * (t ** i) * ((1 - t) ** (n - i))
@@ -748,137 +758,170 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
                 {'chunk_size': 100, 'brush_size': 2, 'opacity': 150, 'mask': feature_mask},
             ]
 
-        # dryness-based strokes for each pass
-        for pass_i, pass_params in enumerate(painting_passes):
-            if not running:
-                break
-            print(f"Starting painting pass {pass_i + 1}")
+        # --- NEW: Underpainting Pass ---
+        print("\n--- Starting Underpainting Pass ---")
+        underpainting_color_dark = (80, 50, 30)
+        underpainting_color_light = (180, 150, 130)
+        h, w = canvas_height, canvas_width
 
-            max_fps = 60
-            update_interval = 1
-            chunk_counter = 0
+        # Create a pre-calculated underpainting image to sample colors from
+        dark_layer = np.full(image.shape, underpainting_color_dark, dtype=np.uint8)
+        light_layer = np.full(image.shape, underpainting_color_light, dtype=np.uint8)
+        gray_alpha = np.stack([image_gray.astype(np.float32) / 255.0] * 3, axis=-1)
+        underpainting_image = (dark_layer * (1 - gray_alpha) + light_layer * gray_alpha).astype(np.uint8)
 
-            # Choose one set of layer ranges (or a single full-range layer)
-            layer_ranges = list(zip(layer_edges[:-1], layer_edges[1:])) if layer_edges is not None else [(0.0, 1.0)]
+        # Paint the canvas with broad strokes using the underpainting colors
+        for y in range(0, h, 15): # Coarse grid
+            if not running: break
+            for x in range(0, w, 15):
+                if not running: break
+                paint_color = tuple(underpainting_image[y, x])
+                angle = random.uniform(0, 360)
+                length = random.randint(20, 35)
+                end_x = max(0, min(w - 1, x + int(length * np.cos(np.deg2rad(angle)))))
+                end_y = max(0, min(h - 1, y + int(length * np.sin(np.deg2rad(angle)))))
+                generate_stroke(
+                    canvas, start_pos=(x, y), end_pos=(end_x, end_y),
+                    color=paint_color, stroke_size=random.randint(15, 25),
+                    transparency=random.randint(100, 150), brush_texture='Oil'
+                )
+            if y % 60 == 0:
+                screen.blit(canvas, (0,0))
+                pygame.display.flip()
+                capture_frame_if_recording()
 
-            for layer_i, (dlo, dhi) in enumerate(layer_ranges):
-                for color_, seglist in sorted_tones:
-                    if not running:
-                        break
-                    for (sid, mask_) in seglist:
-                        if not running:
-                            break
+        screen.blit(canvas, (0,0))
+        pygame.display.flip()
+        capture_frame_if_recording()
+        print("--- Underpainting Complete ---")
+        time.sleep(1.0) # Pause to appreciate the underpainting
 
-                        py_, px_ = np.where(mask_)
+        # --- Attention-Driven Painting Logic ---
+        # 1. Find focus regions from saliency map
+        _, thresh_sal = cv2.threshold(sal_map, 100, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresh_sal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        focus_contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        focus_contours = [c for c in focus_contours if cv2.contourArea(c) > 100]
 
-                        # Apply additional masks (edges/features) from the pass
-                        if pass_params['mask'] is not None:
-                            extra_m = pass_params['mask'][py_, px_]
-                            py_, px_ = py_[extra_m], px_[extra_m]
-                            if len(py_) == 0:
-                                continue
+        # Combine all focus contours into one list for iteration, plus a final 'None' for the whole canvas
+        all_focus_areas = focus_contours + [None]
 
-                        # Filter by depth layer
-                        if depth01 is not None:
-                            dvals = depth01[py_, px_]
-                            keep = (dvals >= dlo) & (dvals < dhi)
-                            py_, px_ = py_[keep], px_[keep]
-                            if len(py_) == 0:
-                                continue
+        for area_idx, contour in enumerate(all_focus_areas):
+            if not running: break
 
-                        points = list(zip(px_, py_))
-                        # cluster by 50x50 grid
-                        grid = defaultdict(list)
-                        for (xx, yy) in points:
-                            gkey = (xx // 50, yy // 50)
-                            grid[gkey].append((xx, yy))
+            is_final_pass = (contour is None)
+            focus_mask = None
+            if not is_final_pass:
+                print(f"\n--- Focusing on salient region {area_idx + 1}/{len(focus_contours)} ---")
+                focus_mask = np.zeros_like(image_gray, dtype=np.uint8)
+                cv2.drawContours(focus_mask, [contour], -1, 255, -1)
+                # For focused passes, maybe we do fewer, more detailed passes
+                passes_to_run = painting_passes
+            else:
+                print("\n--- Final broad pass for background and blending ---")
+                # For the final pass, just do the broadest strokes
+                passes_to_run = painting_passes[:1]
 
-                        for gcell in sorted(grid.keys()):
-                            cell_points = grid[gcell]
-                            # Blend stroke direction with depth tangents near depth edges
-                            if depth_tangent_angle is not None and depth_grad_mag is not None:
-                                def blended_angle(y, x):
-                                    img_ang = orientation[y, x]
-                                    dep_tan = depth_tangent_angle[y, x]
-                                    w = min(1.0, float(depth_grad_mag[y, x]) * 1.5)  # more weight near silhouette
-                                    # circular blend
-                                    a = np.deg2rad(img_ang)
-                                    b = np.deg2rad(dep_tan)
-                                    vx = (1-w)*np.cos(a) + w*np.cos(b)
-                                    vy = (1-w)*np.sin(a) + w*np.sin(b)
-                                    return (np.rad2deg(np.arctan2(vy, vx)) + 360.0) % 360.0
-                                cell_points.sort(key=lambda p: blended_angle(p[1], p[0]))
-                            else:
-                                cell_points.sort(key=lambda p: orientation[p[1], p[0]])
+            for pass_i, pass_params in enumerate(passes_to_run):
+                if not running: break
+                print(f"Starting painting pass {pass_i + 1}")
 
-                            csize = pass_params['chunk_size']
-                            chunks = [cell_points[i:i+csize] for i in range(0, len(cell_points), csize)]
+                max_fps = 60
+                update_interval = 1
+                chunk_counter = 0
+                layer_ranges = list(zip(layer_edges[:-1], layer_edges[1:])) if layer_edges is not None else [(0.0, 1.0)]
 
-                            for chunk in chunks:
-                                if not running:
-                                    break
-                                for event in pygame.event.get():
-                                    if event.type == QUIT:
-                                        running = False
-                                        break
-                                if not running:
-                                    break
+                for layer_i, (dlo, dhi) in enumerate(layer_ranges):
+                    for color_, seglist in sorted_tones:
+                        if not running: break
+                        for (sid, mask_) in seglist:
+                            if not running: break
 
-                                # depth-aware drying
-                                if dry_rate_map is not None:
-                                    dryness_step(dryness_map, inc=0.01, rate_map=dry_rate_map)
+                            py_, px_ = np.where(mask_)
+
+                            if focus_mask is not None:
+                                focus_points_mask = focus_mask[py_, px_] > 0
+                                if not np.any(focus_points_mask):
+                                    continue
+                                py_, px_ = py_[focus_points_mask], px_[focus_points_mask]
+
+                            if pass_params['mask'] is not None:
+                                extra_m = pass_params['mask'][py_, px_]
+                                py_, px_ = py_[extra_m], px_[extra_m]
+                                if len(py_) == 0: continue
+
+                            if depth01 is not None:
+                                dvals = depth01[py_, px_]
+                                keep = (dvals >= dlo) & (dvals < dhi)
+                                py_, px_ = py_[keep], px_[keep]
+                                if len(py_) == 0: continue
+
+                            points = list(zip(px_, py_))
+                            grid = defaultdict(list)
+                            for (xx, yy) in points:
+                                gkey = (xx // 50, yy // 50)
+                                grid[gkey].append((xx, yy))
+
+                            for gcell in sorted(grid.keys()):
+                                cell_points = grid[gcell]
+                                if depth_tangent_angle is not None and depth_grad_mag is not None:
+                                    def blended_angle(y, x):
+                                        img_ang, dep_tan = orientation[y, x], depth_tangent_angle[y, x]
+                                        w = min(1.0, float(depth_grad_mag[y, x]) * 1.5)
+                                        a, b = np.deg2rad(img_ang), np.deg2rad(dep_tan)
+                                        vx, vy = (1-w)*np.cos(a) + w*np.cos(b), (1-w)*np.sin(a) + w*np.sin(b)
+                                        return (np.rad2deg(np.arctan2(vy, vx)) + 360.0) % 360.0
+                                    cell_points.sort(key=lambda p: blended_angle(p[1], p[0]))
                                 else:
-                                    dryness_step(dryness_map, inc=0.01)
+                                    cell_points.sort(key=lambda p: orientation[p[1], p[0]])
 
-                                # paint each pixel as a stroke
-                                for (xx, yy) in chunk:
-                                    d = float(depth01[yy, xx]) if depth01 is not None else 0.5
-                                    sz_sc, len_sc, op_sc, flow_sc, wa_sc, _, _ = depth_modulators(d)
+                                csize = pass_params['chunk_size']
+                                chunks = [cell_points[i:i+csize] for i in range(0, len(cell_points), csize)]
+                                for chunk in chunks:
+                                    if not running: break
+                                    for event in pygame.event.get():
+                                        if event.type == QUIT: running = False; break
+                                    if not running: break
 
-                                    brush_size = max(1, int(pass_params['brush_size'] * sz_sc))
-                                    local_carried = {}
+                                    if dry_rate_map is not None: dryness_step(dryness_map, 0.01, dry_rate_map)
+                                    else: dryness_step(dryness_map, 0.01)
 
-                                    # angle (possibly blended already)
-                                    if depth_tangent_angle is not None and depth_grad_mag is not None:
-                                        ang = blended_angle(yy, xx)
-                                    else:
-                                        ang = orientation[yy, xx]
+                                    for (xx, yy) in chunk:
+                                        d = float(depth01[yy, xx]) if depth01 is not None else 0.5
+                                        sz_sc, len_sc, op_sc, _, wa_sc, _, _ = depth_modulators(d)
+                                        brush_size = max(1, int(pass_params['brush_size'] * sz_sc))
+                                        local_carried = {}
+                                        if depth_tangent_angle is not None and depth_grad_mag is not None:
+                                            ang = blended_angle(yy, xx)
+                                        else:
+                                            ang = orientation[yy, xx]
+                                        length = max(3, int(random.randint(5, 10) * len_sc))
+                                        end_x = max(0, min(canvas_width - 1, xx + int(length * np.cos(np.deg2rad(ang)))))
+                                        end_y = max(0, min(canvas_height - 1, yy + int(length * np.sin(np.deg2rad(ang)))))
+                                        paint_color = tuple(color_)
+                                        if depth01 is not None:
+                                            paint_color = apply_aerial_perspective(paint_color, d, strength=0.35)
+                                        local_water_alpha = 0.3 * wa_sc
+                                        generate_stroke_dryness(
+                                            canvas, (xx, yy), (end_x, end_y),
+                                            dryness_map, thickness_map, brush_texture, paint_color,
+                                            stroke_size=brush_size, carried_color_dict=local_carried,
+                                            water_alpha=local_water_alpha, glazing_factor=0.8)
 
-                                    base_len = random.randint(5, 10)
-                                    length = max(3, int(base_len * len_sc))
-                                    end_x = xx + int(length * np.cos(np.deg2rad(ang)))
-                                    end_y = yy + int(length * np.sin(np.deg2rad(ang)))
-                                    end_x = max(0, min(canvas_width-1, end_x))
-                                    end_y = max(0, min(canvas_height-1, end_y))
+                                    chunk_counter += 1
+                                    if chunk_counter % update_interval == 0:
+                                        screen.blit(canvas, (0, 0))
+                                        pygame.display.flip()
+                                        capture_frame_if_recording()
+                                        clock.tick(max_fps)
+                                    if chunk_counter % 5 == 0: time.sleep(random.uniform(0.05, 0.2))
 
-                                    # subtle aerial perspective on the cluster color
-                                    paint_color = tuple(color_)  # numpy -> tuple
-                                    if depth01 is not None:
-                                        paint_color = apply_aerial_perspective(paint_color, d, strength=0.35)
-
-                                    # Watercolor alpha scaled by depth (far = softer)
-                                    local_water_alpha = 0.3 * wa_sc
-
-                                    # Temporarily scale deposit factors by flow_sc (oil only).
-                                    # Easiest is to bias brush_color toward higher opacity via repeated stamping;
-                                    # here we pass color as-is and let the textured brushes do the visual work.
-                                    generate_stroke_dryness(
-                                        canvas,
-                                        (xx, yy),
-                                        (end_x, end_y),
-                                        dryness_map, thickness_map,
-                                        brush_texture, paint_color,
-                                        stroke_size=brush_size,
-                                        carried_color_dict=local_carried,
-                                        water_alpha=local_water_alpha
-                                    )
-
-                                chunk_counter += 1
-                                if chunk_counter % update_interval == 0:
-                                    screen.blit(canvas, (0,0))
-                                    pygame.display.flip()
-                                    capture_frame_if_recording()
-                                    clock.tick(max_fps)
+            # Update screen after a region is done
+            screen.blit(canvas, (0,0))
+            pygame.display.flip()
+            capture_frame_if_recording()
+            if not is_final_pass:
+                time.sleep(0.3) # Pause before next region
 
     if not running:
         print("Painting simulation terminated by user.")
@@ -979,6 +1022,10 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
                                 video_writer.write(frame_bgr)
 
                             clock.tick(60)
+
+                            # Pause to simulate artist thinking
+                            if random.random() < 0.1: # 10% chance of a short pause
+                                time.sleep(random.uniform(0.01, 0.05))
 
     def save_canvas_image(surface, prefix='painting'):
         directory = os.path.dirname(os.path.abspath(__file__))
