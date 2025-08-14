@@ -25,6 +25,52 @@ import random
 from sklearn.cluster import KMeans
 
 # ----------------------------
+# Paint Palette Simulation
+# ----------------------------
+class PaintPalette:
+    def __init__(self, size=(300, 150), pos=(50, 50)):
+        self.size = size
+        self.pos = pos
+        self.surface = pygame.Surface(size, pygame.SRCALPHA)
+        self.surface.fill((255, 255, 255, 128))  # Semi-transparent white
+        pygame.draw.rect(self.surface, (0, 0, 0), self.surface.get_rect(), 2) # Border
+        self.mix_pos = [size[0] * 0.1, size[1] * 0.5]
+        self.last_mix_result = (0,0,0)
+
+    def mix_colors(self, base_color, new_color, ratio=0.5):
+        """
+        Visually mixes two colors on the palette and returns the result.
+        """
+        # Clear a section for the new mix
+        self.surface.fill((255, 255, 255, 128), (self.mix_pos[0]-10, self.mix_pos[1]-30, 100, 70))
+
+        # Draw splotches of the two colors
+        pygame.draw.circle(self.surface, base_color, (int(self.mix_pos[0]), int(self.mix_pos[1])-20), 15)
+        pygame.draw.circle(self.surface, new_color, (int(self.mix_pos[0])+30, int(self.mix_pos[1])-20), 15)
+
+        # Mix the colors
+        mixed_color = (
+            int(base_color[0] * (1 - ratio) + new_color[0] * ratio),
+            int(base_color[1] * (1 - ratio) + new_color[1] * ratio),
+            int(base_color[2] * (1 - ratio) + new_color[2] * ratio)
+        )
+        self.last_mix_result = mixed_color
+
+        # Draw the mixed splotch
+        pygame.draw.circle(self.surface, mixed_color, (int(self.mix_pos[0])+15, int(self.mix_pos[1])+20), 20)
+
+        # Update mix position for next time
+        self.mix_pos[0] += 60
+        if self.mix_pos[0] > self.size[0] - 50:
+            self.mix_pos[0] = self.size[0] * 0.1
+
+        return mixed_color
+
+    def draw(self, screen):
+        """Draws the palette onto the main screen."""
+        screen.blit(self.surface, self.pos)
+
+# ----------------------------
 # Tkinter UI for user options
 # ----------------------------
 def select_options():
@@ -82,26 +128,32 @@ def select_options():
             record_var.get())
 
 
-def select_image():
-    """Open a file dialog to select an image."""
+def select_image_paths():
+    """Open file dialogs to select the four required images."""
     root = tk.Tk()
     root.withdraw()
-    file_path = filedialog.askopenfilename(
-        title="Select an Image",
-        filetypes=[("Image Files", "*.jpg;*.jpeg;*.png")])
-    root.destroy()
-    return file_path
 
+    paths = {}
+    prompts = {
+        "background": "Select the Background Image",
+        "background_depth": "Select the Background's Depth Map",
+        "person": "Select the Final Image with Person",
+        "person_depth": "Select the Person's Depth Map"
+    }
 
-def select_depth_image():
-    """Open a file dialog to select an optional depth map image (grayscale). Cancel to skip."""
-    root = tk.Tk()
-    root.withdraw()
-    file_path = filedialog.askopenfilename(
-        title="Select a Depth Map (optional)",
-        filetypes=[("Image Files", "*.png;*.jpg;*.jpeg")])
+    for key, title in prompts.items():
+        path = filedialog.askopenfilename(
+            title=title,
+            filetypes=[("Image Files", "*.jpg;*.jpeg;*.png")]
+        )
+        if not path:
+            print(f"Image selection cancelled for {key}. Exiting.")
+            root.destroy()
+            return None
+        paths[key] = path
+
     root.destroy()
-    return file_path or None
+    return paths
 
 
 # ----------------------------
@@ -201,18 +253,20 @@ def alpha_blend(bg, fg, alpha):
     return (int(r), int(g), int(b))
 
 
-def mix_physically(base_rgb, blend_rgb, ratio):
+def mix_physically(base_rgb, blend_rgb, ratio, palette=None):
     """
-    Placeholder for a more advanced “physical mixing.”
-    Using alpha_blend for demonstration.
-    ratio in [0..1].
+    Uses the palette to visually mix colors, if provided.
     """
+    if palette:
+        return palette.mix_colors(base_rgb, blend_rgb, ratio)
+    # Fallback to simple alpha blend if no palette
     return alpha_blend(base_rgb, blend_rgb, ratio)
 
 
 def paint_oil_pixel(canvas, x, y,
                     dryness_map, thickness_map,
                     carried_color, brush_color,
+                    palette,  # Pass palette object
                     pickup_ratio=0.3, deposit_factor=0.7):
     """
     - dryness_map[y, x] -> dryness in [0..1], 1=fully dry
@@ -229,11 +283,11 @@ def paint_oil_pixel(canvas, x, y,
 
     # Pickup
     pick = pickup_ratio * wet_factor
-    new_carried = mix_physically(carried_color, existing_rgb, pick)
+    new_carried = mix_physically(carried_color, existing_rgb, pick, palette)
 
     # Deposit
     deposit = deposit_factor + (0.3 * wet_factor)
-    out_color = mix_physically(existing_rgb, new_carried, deposit)
+    out_color = mix_physically(existing_rgb, new_carried, deposit, palette)
 
     # thickness grows
     thickness_map[y, x] += 0.05 * (1.0 + wet_factor)
@@ -299,6 +353,36 @@ def segment_image(image, num_segments=500):
     return segments
 
 
+def create_character_mask(person_image_path, background_image_path, target_size):
+    """
+    Creates a character mask by differencing the person and background images.
+    """
+    person_img = cv2.imread(person_image_path)
+    bg_img = cv2.imread(background_image_path)
+
+    if person_img is None or bg_img is None:
+        print("Warning: Could not load images for character masking.")
+        return None
+
+    person_img = cv2.resize(person_img, target_size)
+    bg_img = cv2.resize(bg_img, target_size)
+
+    # Compute the absolute difference
+    diff = cv2.absdiff(person_img, bg_img)
+
+    # Convert to grayscale
+    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+
+    # Threshold to create a binary mask
+    _, mask = cv2.threshold(gray_diff, 30, 255, cv2.THRESH_BINARY)
+
+    # Optional: morphological operations to clean up the mask
+    mask = cv2.erode(mask, None, iterations=2)
+    mask = cv2.dilate(mask, None, iterations=2)
+
+    return mask
+
+
 def identify_painting_style(image):
     gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray_image, 50, 150)
@@ -333,6 +417,7 @@ def generate_stroke_dryness(
     brush_texture, brush_color,
     stroke_size,
     carried_color_dict,
+    palette, # Pass palette
     water_alpha=0.3
 ):
     """
@@ -367,7 +452,8 @@ def generate_stroke_dryness(
                             carried_color = paint_oil_pixel(
                                 canvas, xx, yy,
                                 dryness_map, thickness_map,
-                                carried_color, brush_color
+                                carried_color, brush_color,
+                                palette # Pass down
                             )
                         elif brush_texture.lower() == 'watercolor':
                             paint_water_pixel(
@@ -490,15 +576,22 @@ def generate_stroke(surface, start_pos, end_pos, color, stroke_size, transparenc
 # ----------------------------
 # Main painting routine
 # ----------------------------
-def run_painting_simulation(image_path, painting_style, brush_texture, reconstruction_mode, record, depth_path=None):
+def run_painting_simulation(bg_image_path, bg_depth_path, person_image_path, person_depth_path,
+                            painting_style, brush_texture, reconstruction_mode, record):
     pygame.init()
+
+    # Initialize the palette
+    palette = PaintPalette(size=(300, 100), pos=(10, 10))
+
 
     screen_info = pygame.display.Info()
     screen_width, screen_height = screen_info.current_w, screen_info.current_h
 
-    image = cv2.imread(image_path)
+    # Phase 1: Load Background Image
+    print("Phase 1: Painting Background")
+    image = cv2.imread(bg_image_path)
     if image is None:
-        print("Error: Unable to load image.")
+        print("Error: Unable to load background image.")
         pygame.quit()
         return
 
@@ -521,8 +614,9 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
     depth_tangent_angle = None
     dry_rate_map = None
 
-    if depth_path:
-        depth01 = load_depth_map(depth_path, (canvas_width, canvas_height))  # 0=far, 1=near
+    # Load background depth map
+    if bg_depth_path:
+        depth01 = load_depth_map(bg_depth_path, (canvas_width, canvas_height))  # 0=far, 1=near
         if depth01 is not None:
             # Depth gradient for edge awareness and stroke tangents along silhouettes
             d_dx = cv2.Sobel(depth01, cv2.CV_32F, 1, 0, ksize=3)
@@ -870,15 +964,104 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
                                         brush_texture, paint_color,
                                         stroke_size=brush_size,
                                         carried_color_dict=local_carried,
+                                        palette=palette,
                                         water_alpha=local_water_alpha
                                     )
 
                                 chunk_counter += 1
                                 if chunk_counter % update_interval == 0:
                                     screen.blit(canvas, (0,0))
+                                    palette.draw(screen)
                                     pygame.display.flip()
                                     capture_frame_if_recording()
                                     clock.tick(max_fps)
+
+    # -------------------------------------------------
+    # Phase 2: Character Painting
+    # -------------------------------------------------
+    print("\nPhase 2: Painting Character")
+    character_mask = create_character_mask(person_image_path, bg_image_path, (canvas_width, canvas_height))
+
+    if character_mask is not None:
+        person_image = cv2.imread(person_image_path)
+        person_image = cv2.resize(person_image, (canvas_width, canvas_height))
+        person_image_rgb = cv2.cvtColor(person_image, cv2.COLOR_BGR2RGB)
+        person_image_gray = cv2.cvtColor(person_image, cv2.COLOR_BGR2GRAY)
+
+        # Use person's depth map for this phase
+        person_depth01 = load_depth_map(person_depth_path, (canvas_width, canvas_height))
+
+        # Re-compute segments and features based on the person image
+        segments = segment_image(person_image_rgb, num_segments=1000)
+
+        color_tones = defaultdict(list)
+        seg_ids = np.unique(segments)
+        for seg_id in seg_ids:
+            mask_ = (segments == seg_id) & (character_mask > 0) # Apply character mask here
+            if np.any(mask_):
+                yy, xx = np.where(mask_)
+                avgc = np.mean(person_image_rgb[mask_], axis=0).astype(int)
+                avgc_tuple = tuple(avgc)
+                color_tones[avgc_tuple].append((seg_id, mask_))
+
+        sorted_tones = sorted(color_tones.items(), key=lambda it: get_brightness(it[0]))
+
+        grad_x = cv2.Sobel(person_image_gray, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(person_image_gray, cv2.CV_32F, 0, 1, ksize=3)
+        orientation = cv2.phase(grad_x, grad_y, angleInDegrees=True)
+
+        # A simplified set of passes for the character
+        character_painting_passes = [
+            {'chunk_size': 500, 'brush_size': 3, 'opacity': 120, 'mask': None},
+            {'chunk_size': 200, 'brush_size': 2, 'opacity': 180, 'mask': None},
+        ]
+
+        for pass_i, pass_params in enumerate(character_painting_passes):
+            if not running: break
+            print(f"Starting character painting pass {pass_i + 1}")
+            for color_, seglist in sorted_tones:
+                if not running: break
+                for (sid, mask_) in seglist:
+                    if not running: break
+                    py_, px_ = np.where(mask_)
+                    points = list(zip(px_, py_))
+                    points.sort(key=lambda p: orientation[p[1], p[0]])
+
+                    chunks = [points[i:i+pass_params['chunk_size']] for i in range(0, len(points), pass_params['chunk_size'])]
+
+                    for chunk in chunks:
+                        if not running: break
+                        for event in pygame.event.get():
+                            if event.type == QUIT: running = False
+                        if not running: break
+
+                        for (xx, yy) in chunk:
+                            d = float(person_depth01[yy, xx]) if person_depth01 is not None else 0.8 # Assume character is closer
+                            sz_sc, len_sc, op_sc, flow_sc, wa_sc, _, _ = depth_modulators(d)
+
+                            brush_size = max(1, int(pass_params['brush_size'] * sz_sc))
+                            ang = orientation[yy, xx]
+                            length = max(2, int(random.randint(4, 8) * len_sc))
+                            end_x = max(0, min(canvas_width - 1, xx + int(length * np.cos(np.deg2rad(ang)))))
+                            end_y = max(0, min(canvas_height - 1, yy + int(length * np.sin(np.deg2rad(ang)))))
+
+                            paint_color = tuple(person_image_rgb[yy, xx])
+
+                            generate_stroke_dryness(
+                                canvas, (xx, yy), (end_x, end_y),
+                                dryness_map, thickness_map,
+                                brush_texture, paint_color,
+                                stroke_size=brush_size,
+                                carried_color_dict={}, # Fresh brush for character
+                                palette=palette,
+                                water_alpha=0.3 * wa_sc
+                            )
+
+                        screen.blit(canvas, (0,0))
+                        palette.draw(screen)
+                        pygame.display.flip()
+                        capture_frame_if_recording()
+                        clock.tick(60)
 
     if not running:
         print("Painting simulation terminated by user.")
@@ -1018,9 +1201,17 @@ if __name__ == "__main__":
     if not style:
         print("No painting style selected. Exiting.")
     else:
-        image_path = select_image()
-        if image_path:
-            depth_path = select_depth_image()  # <-- new (Cancel to skip)
-            run_painting_simulation(image_path, style, texture, mode, record_flag, depth_path=depth_path)
+        image_paths = select_image_paths()
+        if image_paths:
+            run_painting_simulation(
+                bg_image_path=image_paths["background"],
+                bg_depth_path=image_paths["background_depth"],
+                person_image_path=image_paths["person"],
+                person_depth_path=image_paths["person_depth"],
+                painting_style=style,
+                brush_texture=texture,
+                reconstruction_mode=mode,
+                record=record_flag
+            )
         else:
-            print("No image selected. Exiting.")
+            print("Image selection was not completed. Exiting.")
