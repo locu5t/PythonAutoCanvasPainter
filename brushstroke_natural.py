@@ -93,17 +93,98 @@ def select_image():
     return file_path
 
 
+def select_depth_image():
+    """Open a file dialog to select an optional depth map image (grayscale). Cancel to skip."""
+    root = tk.Tk()
+    root.withdraw()
+    file_path = filedialog.askopenfilename(
+        title="Select a Depth Map (optional)",
+        filetypes=[("Image Files", "*.png;*.jpg;*.jpeg")])
+    root.destroy()
+    return file_path or None
+
+
+# ----------------------------
+# Depth helpers
+# ----------------------------
+def load_depth_map(depth_path, target_size):
+    """
+    Loads a depth map (grayscale), resizes to target_size (w,h), and normalizes to [0..1].
+    Auto-inverts if the top of the image is on average brighter than the bottom (sky brighter).
+    Returns depth01 where 0=farthest, 1=nearest.
+    """
+    if not depth_path or not os.path.exists(depth_path):
+        return None
+
+    d = cv2.imread(depth_path, cv2.IMREAD_GRAYSCALE)
+    if d is None:
+        print("Warning: could not read depth map, continuing without it.")
+        return None
+
+    w, h = target_size
+    d = cv2.resize(d, (w, h), interpolation=cv2.INTER_LINEAR)
+    d = d.astype(np.float32) / 255.0
+
+    # Heuristic auto-invert: if top band brighter than bottom band, assume near=dark (invert)
+    h3 = max(1, h // 3)
+    top_mean = np.mean(d[:h3, :])
+    bottom_mean = np.mean(d[-h3:, :])
+    if top_mean > bottom_mean:
+        d = 1.0 - d
+
+    d = np.clip(d, 0.0, 1.0)
+    return d
+
+def apply_aerial_perspective(rgb, depth01, strength=0.45, atmosphere_rgb=(220, 230, 255)):
+    """
+    Simple aerial perspective: desaturate and mix toward atmosphere color as depth increases.
+    rgb: tuple/list of 3 ints (0..255)
+    """
+    c = np.array(rgb, dtype=np.float32)
+    atm = np.array(atmosphere_rgb, dtype=np.float32)
+    t = np.power(float(depth01), 1.2) * float(strength)
+
+    # Linear mix toward atmosphere
+    mixed = (1.0 - t) * c + t * atm
+
+    # Mild desaturation in HSV
+    hsv = cv2.cvtColor(mixed.reshape(1,1,3).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+    hsv[...,1] *= (1.0 - 0.6 * t)  # reduce saturation with depth
+    hsv[...,1] = np.clip(hsv[...,1], 0, 255)
+    out = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).reshape(3)
+    return tuple(int(v) for v in out)
+
+def depth_modulators(d):
+    """
+    Given depth in [0..1] (0=far, 1=near), return per-stroke scalars:
+      - size_scale: far = larger, near = smaller
+      - length_scale: far = longer, near = shorter
+      - opacity_scale: far = lower, near = higher
+      - flow_scale: affects oil thickness (near lays more paint)
+      - water_alpha_scale: near concentrates pigment more (less bleeding)
+      - dry_rate: multiplier for dryness_step (far dries faster)
+      - initial_dryness: far begins drier, near wetter
+    """
+    size_scale      = np.interp(d, [0, 1], [1.25, 0.75])
+    length_scale    = np.interp(d, [0, 1], [1.6, 0.7])
+    opacity_scale   = np.interp(d, [0, 1], [0.85, 1.10])
+    flow_scale      = np.interp(d, [0, 1], [0.9, 1.3])
+    water_alpha_scale = np.interp(d, [0, 1], [1.2, 0.8])
+    dry_rate        = np.interp(d, [0, 1], [1.6, 0.7])
+    initial_dryness = np.interp(d, [0, 1], [0.85, 0.25])
+    return size_scale, length_scale, opacity_scale, flow_scale, water_alpha_scale, dry_rate, initial_dryness
+
 # ----------------------------
 # Helpers: dryness, thickness
 # ----------------------------
-def dryness_step(dryness_map, inc=0.01):
+def dryness_step(dryness_map, inc=0.01, rate_map=None):
     """
-    Increments dryness in the entire dryness_map, never exceeding 1.0.
-    dryness_map: 2D array of shape (height, width)
-      0.0 = fully wet
-      1.0 = fully dry
+    Increments dryness, optionally scaled per-pixel by rate_map.
     """
-    dryness_map += inc
+    if rate_map is None:
+        dryness_map += inc
+    else:
+        dryness_map += inc * rate_map
     np.clip(dryness_map, 0.0, 1.0, out=dryness_map)
 
 
@@ -325,10 +406,10 @@ def generate_stroke(surface, start_pos, end_pos, color, stroke_size, transparenc
     """Generate a stylized stroke on the given surface based on brush texture."""
     # Define control points for the Bézier curve with limited randomness
     control_points = [start_pos]
-    
+
     brush_texture_lower = brush_texture.lower()
     mid_point = ((start_pos[0] + end_pos[0]) / 2, (start_pos[1] + end_pos[1]) / 2)
-    
+
     if brush_texture_lower == 'oil':
         mid_point = (
             mid_point[0] + random.uniform(-5, 5),
@@ -409,7 +490,7 @@ def generate_stroke(surface, start_pos, end_pos, color, stroke_size, transparenc
 # ----------------------------
 # Main painting routine
 # ----------------------------
-def run_painting_simulation(image_path, painting_style, brush_texture, reconstruction_mode, record):
+def run_painting_simulation(image_path, painting_style, brush_texture, reconstruction_mode, record, depth_path=None):
     pygame.init()
 
     screen_info = pygame.display.Info()
@@ -434,6 +515,33 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
+    # ----- Depth map (optional) -----
+    depth01 = None
+    depth_grad_mag = None
+    depth_tangent_angle = None
+    dry_rate_map = None
+
+    if depth_path:
+        depth01 = load_depth_map(depth_path, (canvas_width, canvas_height))  # 0=far, 1=near
+        if depth01 is not None:
+            # Depth gradient for edge awareness and stroke tangents along silhouettes
+            d_dx = cv2.Sobel(depth01, cv2.CV_32F, 1, 0, ksize=3)
+            d_dy = cv2.Sobel(depth01, cv2.CV_32F, 0, 1, ksize=3)
+            depth_grad_mag = cv2.magnitude(d_dx, d_dy)
+            depth_grad_mag = cv2.normalize(depth_grad_mag, None, 0, 1, cv2.NORM_MINMAX)
+            # Tangent angle is gradient angle + 90°
+            depth_angle = (cv2.phase(d_dx, d_dy, angleInDegrees=True) + 90.0) % 360.0
+            depth_tangent_angle = depth_angle
+
+            # Initialize dryness map from depth (far = drier)
+            # and a per-pixel drying rate (far dries faster)
+            size_scale, length_scale, opacity_scale, flow_scale, water_alpha_scale, dry_rate, initial_dryness = \
+                depth_modulators(depth01)
+            dryness_map = initial_dryness.astype(np.float32).copy()
+            dry_rate_map = dry_rate.astype(np.float32)
+        else:
+            depth01 = None  # ensure consistency
+
     screen_size = (canvas_width, canvas_height)
     screen = pygame.display.set_mode(screen_size)
     pygame.display.set_caption("Painting Simulation")
@@ -444,8 +552,9 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
     clock = pygame.time.Clock()
     running = True
 
-    # dryness/thickness maps
-    dryness_map = np.ones((canvas_height, canvas_width), dtype=np.float32)
+    # dryness/thickness maps (depth may have already initialized dryness_map)
+    if 'dryness_map' not in locals():
+        dryness_map = np.ones((canvas_height, canvas_width), dtype=np.float32)
     thickness_map = np.zeros((canvas_height, canvas_width), dtype=np.float32)
 
     # Possibly start a video writer
@@ -495,7 +604,7 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
         chunks = [pixels[i:i+chunk_size] for i in range(0, total_px, chunk_size)]
 
         for chunk in chunks:
-            if not running: 
+            if not running:
                 break
             for event in pygame.event.get():
                 if event.type == QUIT:
@@ -542,7 +651,7 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
         order = sorted(range(num_clusters), key=lambda c: cluster_brightness(cluster_centers[c]))
 
         for i, cluster_label in enumerate(order):
-            if not running: 
+            if not running:
                 break
             positions = clusters[cluster_label]
             chunk_size = 5000
@@ -581,6 +690,13 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
         edge_mask = edge_map > 0
         feature_mask = detect_features(image_gray)
         segments = segment_image(image_rgb, num_segments=1500)
+
+        # Depth layers: paint far -> near to respect occlusion
+        if depth01 is not None:
+            # 5 layers is a good balance
+            layer_edges = np.quantile(depth01, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+        else:
+            layer_edges = None
 
         color_tones = defaultdict(list)
         seg_ids = np.unique(segments)
@@ -640,80 +756,129 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
 
             max_fps = 60
             update_interval = 1
-
             chunk_counter = 0
 
-            for color_, seglist in sorted_tones:
-                if not running: 
-                    break
-                for (sid, mask_) in seglist:
+            # Choose one set of layer ranges (or a single full-range layer)
+            layer_ranges = list(zip(layer_edges[:-1], layer_edges[1:])) if layer_edges is not None else [(0.0, 1.0)]
+
+            for layer_i, (dlo, dhi) in enumerate(layer_ranges):
+                for color_, seglist in sorted_tones:
                     if not running:
                         break
-                    py_, px_ = np.where(mask_)
-                    if pass_params['mask'] is not None:
-                        extra_m = pass_params['mask'][py_, px_]
-                        py_ = py_[extra_m]
-                        px_ = px_[extra_m]
-                        if len(py_) == 0:
-                            continue
-                    points = list(zip(px_, py_))
-                    # cluster by 50x50 grid
-                    grid = defaultdict(list)
-                    for (xx, yy) in points:
-                        gkey = (xx // 50, yy // 50)
-                        grid[gkey].append((xx, yy))
+                    for (sid, mask_) in seglist:
+                        if not running:
+                            break
 
-                    for gcell in sorted(grid.keys()):
-                        cell_points = grid[gcell]
-                        # sort by orientation
-                        cell_points.sort(key=lambda p: orientation[p[1], p[0]])
-                        csize = pass_params['chunk_size']
-                        chunks = [cell_points[i:i+csize] for i in range(0, len(cell_points), csize)]
-                        for chunk in chunks:
-                            if not running:
-                                break
-                            for event in pygame.event.get():
-                                if event.type == QUIT:
-                                    running = False
+                        py_, px_ = np.where(mask_)
+
+                        # Apply additional masks (edges/features) from the pass
+                        if pass_params['mask'] is not None:
+                            extra_m = pass_params['mask'][py_, px_]
+                            py_, px_ = py_[extra_m], px_[extra_m]
+                            if len(py_) == 0:
+                                continue
+
+                        # Filter by depth layer
+                        if depth01 is not None:
+                            dvals = depth01[py_, px_]
+                            keep = (dvals >= dlo) & (dvals < dhi)
+                            py_, px_ = py_[keep], px_[keep]
+                            if len(py_) == 0:
+                                continue
+
+                        points = list(zip(px_, py_))
+                        # cluster by 50x50 grid
+                        grid = defaultdict(list)
+                        for (xx, yy) in points:
+                            gkey = (xx // 50, yy // 50)
+                            grid[gkey].append((xx, yy))
+
+                        for gcell in sorted(grid.keys()):
+                            cell_points = grid[gcell]
+                            # Blend stroke direction with depth tangents near depth edges
+                            if depth_tangent_angle is not None and depth_grad_mag is not None:
+                                def blended_angle(y, x):
+                                    img_ang = orientation[y, x]
+                                    dep_tan = depth_tangent_angle[y, x]
+                                    w = min(1.0, float(depth_grad_mag[y, x]) * 1.5)  # more weight near silhouette
+                                    # circular blend
+                                    a = np.deg2rad(img_ang)
+                                    b = np.deg2rad(dep_tan)
+                                    vx = (1-w)*np.cos(a) + w*np.cos(b)
+                                    vy = (1-w)*np.sin(a) + w*np.sin(b)
+                                    return (np.rad2deg(np.arctan2(vy, vx)) + 360.0) % 360.0
+                                cell_points.sort(key=lambda p: blended_angle(p[1], p[0]))
+                            else:
+                                cell_points.sort(key=lambda p: orientation[p[1], p[0]])
+
+                            csize = pass_params['chunk_size']
+                            chunks = [cell_points[i:i+csize] for i in range(0, len(cell_points), csize)]
+
+                            for chunk in chunks:
+                                if not running:
                                     break
-                            if not running:
-                                break
+                                for event in pygame.event.get():
+                                    if event.type == QUIT:
+                                        running = False
+                                        break
+                                if not running:
+                                    break
 
-                            # dryness step each chunk so canvas slowly dries
-                            dryness_step(dryness_map, inc=0.01)
+                                # depth-aware drying
+                                if dry_rate_map is not None:
+                                    dryness_step(dryness_map, inc=0.01, rate_map=dry_rate_map)
+                                else:
+                                    dryness_step(dryness_map, inc=0.01)
 
-                            # paint each pixel as a stroke
-                            for (xx, yy) in chunk:
-                                brush_size = pass_params['brush_size']
-                                local_carried = {}
+                                # paint each pixel as a stroke
+                                for (xx, yy) in chunk:
+                                    d = float(depth01[yy, xx]) if depth01 is not None else 0.5
+                                    sz_sc, len_sc, op_sc, flow_sc, wa_sc, _, _ = depth_modulators(d)
 
-                                angle = orientation[yy, xx]
-                                length = random.randint(5, 10)
-                                end_x = xx + int(length * np.cos(np.deg2rad(angle)))
-                                end_y = yy + int(length * np.sin(np.deg2rad(angle)))
-                                end_x = max(0, min(canvas_width-1, end_x))
-                                end_y = max(0, min(canvas_height-1, end_y))
+                                    brush_size = max(1, int(pass_params['brush_size'] * sz_sc))
+                                    local_carried = {}
 
-                                generate_stroke_dryness(
-                                    canvas,
-                                    (xx, yy),
-                                    (end_x, end_y),
-                                    dryness_map, thickness_map,
-                                    brush_texture, color_,
-                                    stroke_size=brush_size,
-                                    carried_color_dict=local_carried
-                                )
+                                    # angle (possibly blended already)
+                                    if depth_tangent_angle is not None and depth_grad_mag is not None:
+                                        ang = blended_angle(yy, xx)
+                                    else:
+                                        ang = orientation[yy, xx]
 
-                            chunk_counter += 1
-                            if chunk_counter % update_interval == 0:
-                                screen.blit(canvas, (0,0))
-                                pygame.display.flip()
-                                capture_frame_if_recording()
-                                clock.tick(max_fps)
+                                    base_len = random.randint(5, 10)
+                                    length = max(3, int(base_len * len_sc))
+                                    end_x = xx + int(length * np.cos(np.deg2rad(ang)))
+                                    end_y = yy + int(length * np.sin(np.deg2rad(ang)))
+                                    end_x = max(0, min(canvas_width-1, end_x))
+                                    end_y = max(0, min(canvas_height-1, end_y))
 
-            screen.blit(canvas, (0,0))
-            pygame.display.flip()
-            capture_frame_if_recording()
+                                    # subtle aerial perspective on the cluster color
+                                    paint_color = tuple(color_)  # numpy -> tuple
+                                    if depth01 is not None:
+                                        paint_color = apply_aerial_perspective(paint_color, d, strength=0.35)
+
+                                    # Watercolor alpha scaled by depth (far = softer)
+                                    local_water_alpha = 0.3 * wa_sc
+
+                                    # Temporarily scale deposit factors by flow_sc (oil only).
+                                    # Easiest is to bias brush_color toward higher opacity via repeated stamping;
+                                    # here we pass color as-is and let the textured brushes do the visual work.
+                                    generate_stroke_dryness(
+                                        canvas,
+                                        (xx, yy),
+                                        (end_x, end_y),
+                                        dryness_map, thickness_map,
+                                        brush_texture, paint_color,
+                                        stroke_size=brush_size,
+                                        carried_color_dict=local_carried,
+                                        water_alpha=local_water_alpha
+                                    )
+
+                                chunk_counter += 1
+                                if chunk_counter % update_interval == 0:
+                                    screen.blit(canvas, (0,0))
+                                    pygame.display.flip()
+                                    capture_frame_if_recording()
+                                    clock.tick(max_fps)
 
     if not running:
         print("Painting simulation terminated by user.")
@@ -731,8 +896,8 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
             print(f"Detailed pass iteration {iteration + 1}/{detailed_iterations}")
 
             # Dynamic brush size and opacity based on iteration
-            brush_size = max(1, 2 - iteration)  
-            opacity = max(50, 100 - iteration * 20)  
+            brush_size = max(1, 2 - iteration)
+            opacity = max(50, 100 - iteration * 20)
             chunk_size = 300  # Finer control with smaller chunk size
 
             for color, seglist in sorted_tones:
@@ -762,22 +927,43 @@ def run_painting_simulation(image_path, painting_style, brush_texture, reconstru
                             if not running:
                                 break
                             for x, y in chunk:
-                                current_brush_size = brush_size
-                                current_opacity = opacity
-                                # Use the actual color from the reference image at (y, x)
-                                color_to_paint = image_rgb[y, x]
-                                angle = orientation[y, x]
-                                length = random.randint(3, 6)  # Shorter strokes for details
+                                if depth01 is not None:
+                                    d = float(depth01[y, x])
+                                    sz_sc, len_sc, op_sc, _, _, _, _ = depth_modulators(d)
+                                    # Skip very far points in detail pass to avoid over-detailing background
+                                    if d < 0.20:
+                                        continue
+                                    current_brush_size = max(1, int(brush_size * min(1.0, 1.1 * (1.0/sz_sc))))
+                                    current_opacity = int(opacity * np.clip(op_sc, 0.5, 1.3))
+                                    # Blend angle with depth tangents at strong depth edges
+                                    if depth_tangent_angle is not None and depth_grad_mag is not None:
+                                        w = min(1.0, float(depth_grad_mag[y, x]) * 1.5)
+                                        img_ang = orientation[y, x]
+                                        dep_tan = depth_tangent_angle[y, x]
+                                        a = np.deg2rad(img_ang); b = np.deg2rad(dep_tan)
+                                        vx = (1-w)*np.cos(a) + w*np.cos(b); vy = (1-w)*np.sin(a) + w*np.sin(b)
+                                        angle = (np.rad2deg(np.arctan2(vy, vx)) + 360.0) % 360.0
+                                    else:
+                                        angle = orientation[y, x]
+                                    length = max(2, int(random.randint(3, 6) * len_sc))
+                                    color_to_paint = apply_aerial_perspective(tuple(image_rgb[y, x]), d, strength=0.25)
+                                else:
+                                    current_brush_size = brush_size
+                                    current_opacity = opacity
+                                    color_to_paint = tuple(image_rgb[y, x])
+                                    angle = orientation[y, x]
+                                    length = random.randint(3, 6)
+
                                 end_x = x + int(length * np.cos(np.deg2rad(angle)))
                                 end_y = y + int(length * np.sin(np.deg2rad(angle)))
                                 end_x = max(0, min(canvas_width - 1, end_x))
                                 end_y = max(0, min(canvas_height - 1, end_y))
-                                # Generate stroke using the selected brush texture
+
                                 generate_stroke(
                                     canvas,
                                     start_pos=(x, y),
                                     end_pos=(end_x, end_y),
-                                    color=tuple(color_to_paint),
+                                    color=color_to_paint,
                                     stroke_size=current_brush_size,
                                     transparency=current_opacity,
                                     brush_texture=brush_texture
@@ -834,6 +1020,7 @@ if __name__ == "__main__":
     else:
         image_path = select_image()
         if image_path:
-            run_painting_simulation(image_path, style, texture, mode, record_flag)
+            depth_path = select_depth_image()  # <-- new (Cancel to skip)
+            run_painting_simulation(image_path, style, texture, mode, record_flag, depth_path=depth_path)
         else:
             print("No image selected. Exiting.")
