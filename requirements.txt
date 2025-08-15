@@ -1,0 +1,6 @@
+pygame
+PyOpenGL
+numpy
+scikit-image
+opencv-python
+scikit-learn
