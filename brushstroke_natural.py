@@ -25,52 +25,6 @@ import random
 from sklearn.cluster import KMeans
 
 # ----------------------------
-# Paint Palette Simulation
-# ----------------------------
-class PaintPalette:
-    def __init__(self, size=(300, 150), pos=(50, 50)):
-        self.size = size
-        self.pos = pos
-        self.surface = pygame.Surface(size, pygame.SRCALPHA)
-        self.surface.fill((255, 255, 255, 128))  # Semi-transparent white
-        pygame.draw.rect(self.surface, (0, 0, 0), self.surface.get_rect(), 2) # Border
-        self.mix_pos = [size[0] * 0.1, size[1] * 0.5]
-        self.last_mix_result = (0,0,0)
-
-    def mix_colors(self, base_color, new_color, ratio=0.5):
-        """
-        Visually mixes two colors on the palette and returns the result.
-        """
-        # Clear a section for the new mix
-        self.surface.fill((255, 255, 255, 128), (self.mix_pos[0]-10, self.mix_pos[1]-30, 100, 70))
-
-        # Draw splotches of the two colors
-        pygame.draw.circle(self.surface, base_color, (int(self.mix_pos[0]), int(self.mix_pos[1])-20), 15)
-        pygame.draw.circle(self.surface, new_color, (int(self.mix_pos[0])+30, int(self.mix_pos[1])-20), 15)
-
-        # Mix the colors
-        mixed_color = (
-            int(base_color[0] * (1 - ratio) + new_color[0] * ratio),
-            int(base_color[1] * (1 - ratio) + new_color[1] * ratio),
-            int(base_color[2] * (1 - ratio) + new_color[2] * ratio)
-        )
-        self.last_mix_result = mixed_color
-
-        # Draw the mixed splotch
-        pygame.draw.circle(self.surface, mixed_color, (int(self.mix_pos[0])+15, int(self.mix_pos[1])+20), 20)
-
-        # Update mix position for next time
-        self.mix_pos[0] += 60
-        if self.mix_pos[0] > self.size[0] - 50:
-            self.mix_pos[0] = self.size[0] * 0.1
-
-        return mixed_color
-
-    def draw(self, screen):
-        """Draws the palette onto the main screen."""
-        screen.blit(self.surface, self.pos)
-
-# ----------------------------
 # Tkinter UI for user options
 # ----------------------------
 def select_options():
@@ -253,20 +207,18 @@ def alpha_blend(bg, fg, alpha):
     return (int(r), int(g), int(b))
 
 
-def mix_physically(base_rgb, blend_rgb, ratio, palette=None):
+def mix_physically(base_rgb, blend_rgb, ratio):
     """
-    Uses the palette to visually mix colors, if provided.
+    Placeholder for a more advanced “physical mixing.”
+    Using alpha_blend for demonstration.
+    ratio in [0..1].
     """
-    if palette:
-        return palette.mix_colors(base_rgb, blend_rgb, ratio)
-    # Fallback to simple alpha blend if no palette
     return alpha_blend(base_rgb, blend_rgb, ratio)
 
 
 def paint_oil_pixel(canvas, x, y,
                     dryness_map, thickness_map,
                     carried_color, brush_color,
-                    palette,  # Pass palette object
                     pickup_ratio=0.3, deposit_factor=0.7):
     """
     - dryness_map[y, x] -> dryness in [0..1], 1=fully dry
@@ -283,11 +235,11 @@ def paint_oil_pixel(canvas, x, y,
 
     # Pickup
     pick = pickup_ratio * wet_factor
-    new_carried = mix_physically(carried_color, existing_rgb, pick, palette)
+    new_carried = mix_physically(carried_color, existing_rgb, pick)
 
     # Deposit
     deposit = deposit_factor + (0.3 * wet_factor)
-    out_color = mix_physically(existing_rgb, new_carried, deposit, palette)
+    out_color = mix_physically(existing_rgb, new_carried, deposit)
 
     # thickness grows
     thickness_map[y, x] += 0.05 * (1.0 + wet_factor)
@@ -417,7 +369,6 @@ def generate_stroke_dryness(
     brush_texture, brush_color,
     stroke_size,
     carried_color_dict,
-    palette, # Pass palette
     water_alpha=0.3
 ):
     """
@@ -452,8 +403,7 @@ def generate_stroke_dryness(
                             carried_color = paint_oil_pixel(
                                 canvas, xx, yy,
                                 dryness_map, thickness_map,
-                                carried_color, brush_color,
-                                palette # Pass down
+                                carried_color, brush_color
                             )
                         elif brush_texture.lower() == 'watercolor':
                             paint_water_pixel(
@@ -579,10 +529,6 @@ def generate_stroke(surface, start_pos, end_pos, color, stroke_size, transparenc
 def run_painting_simulation(bg_image_path, bg_depth_path, person_image_path, person_depth_path,
                             painting_style, brush_texture, reconstruction_mode, record):
     pygame.init()
-
-    # Initialize the palette
-    palette = PaintPalette(size=(300, 100), pos=(10, 10))
-
 
     screen_info = pygame.display.Info()
     screen_width, screen_height = screen_info.current_w, screen_info.current_h
@@ -971,7 +917,6 @@ def run_painting_simulation(bg_image_path, bg_depth_path, person_image_path, per
                                 chunk_counter += 1
                                 if chunk_counter % update_interval == 0:
                                     screen.blit(canvas, (0,0))
-                                    palette.draw(screen)
                                     pygame.display.flip()
                                     capture_frame_if_recording()
                                     clock.tick(max_fps)
@@ -1058,7 +1003,6 @@ def run_painting_simulation(bg_image_path, bg_depth_path, person_image_path, per
                             )
 
                         screen.blit(canvas, (0,0))
-                        palette.draw(screen)
                         pygame.display.flip()
                         capture_frame_if_recording()
                         clock.tick(60)

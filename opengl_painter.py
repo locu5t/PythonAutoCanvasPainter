@@ -5,7 +5,7 @@ from OpenGL.GL.shaders import compileProgram, compileShader
 import numpy as np
 import cv2
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, simpledialog
 from skimage import segmentation
 import os
 import ctypes
@@ -30,10 +30,7 @@ out vec4 FragColor;
 uniform vec4 u_color;
 void main()
 {
-    float dist = length(gl_PointCoord - vec2(0.5));
-    if (dist > 0.5) discard;
-    float alpha = 1.0 - smoothstep(0.4, 0.5, dist);
-    FragColor = vec4(u_color.rgb, u_color.a * alpha);
+    FragColor = u_color;
 }
 """
 
@@ -80,16 +77,27 @@ def draw_brush_stroke(shader, vao, pos, size, color, proj_matrix):
     glUseProgram(shader)
     glUniform2f(glGetUniformLocation(shader, "u_pos"), pos[0], pos[1])
     glUniform1f(glGetUniformLocation(shader, "u_size"), size)
-    glUniform4f(glGetUniformLocation(shader, "u_color"), color[0]/255.0, color[1]/255.0, color[2]/255.0, color[3]/255.0)
+    glUniform4f(glGetUniformLocation(shader, "u_color"), color[0]/255.0, color[1]/255.0, color[2]/255.0, color[3]/255.0 if len(color) > 3 else 1.0)
     glUniformMatrix4fv(glGetUniformLocation(shader, "u_projection"), 1, GL_FALSE, proj_matrix)
     glBindVertexArray(vao)
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
 
-def select_image_paths():
+def select_mode():
+    root = tk.Tk()
+    root.withdraw()
+    mode = simpledialog.askstring("Mode", "Enter mode: 'simple' or 'advanced'", parent=root)
+    root.destroy()
+    return mode
+
+def select_image_paths(mode):
     root = tk.Tk()
     root.withdraw()
     paths = {}
-    prompts = {"background": "Select Background Image", "background_depth": "Select Background Depth Map", "person": "Select Person Image", "person_depth": "Select Person Depth Map"}
+    if mode == 'simple':
+        prompts = {"original": "Select Original Image", "depth": "Select Depth Map"}
+    else:
+        prompts = {"background": "Select Background Image", "background_depth": "Select Background Depth Map", "person": "Select Person Image", "person_depth": "Select Person Depth Map"}
+
     for key, title in prompts.items():
         path = filedialog.askopenfilename(title=title, filetypes=[("Image Files", "*.jpg;*.jpeg;*.png")])
         if not path: return None
@@ -115,11 +123,61 @@ def create_character_mask(person_path, bg_path, size):
     _, mask = cv2.threshold(cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY), 30, 255, cv2.THRESH_BINARY)
     return cv2.dilate(cv2.erode(mask, None, iterations=2), None, iterations=2)
 
+def painting_generator(mode, image_paths, shader_draw, vao_brush, proj_matrix, img_w, img_h):
+    if mode == 'simple':
+        print("Painting Simple...")
+        image = cv2.cvtColor(cv2.imread(image_paths["original"]), cv2.COLOR_BGR2RGB)
+        depth_map = load_depth_map(image_paths["depth"], (img_w, img_h))
+        segments = segmentation.slic(image, n_segments=1000, compactness=10)
+        for seg_id in np.unique(segments):
+            mask = (segments == seg_id)
+            avg_color = (*np.mean(image[mask], axis=0).astype(int), 200)
+            for y, x in np.argwhere(mask)[::20]:
+                size, opacity = depth_modulators(depth_map[y, x] if depth_map is not None else 0.5)
+                draw_brush_stroke(shader_draw, vao_brush, (x, y), 15*size, (*avg_color[:3], avg_color[3]*opacity), proj_matrix)
+            yield
+    else:
+        # Phase 1: Background
+        print("Painting Background...")
+        image = cv2.cvtColor(cv2.imread(image_paths["background"]), cv2.COLOR_BGR2RGB)
+        depth_map = load_depth_map(image_paths["background_depth"], (img_w, img_h))
+        segments = segmentation.slic(image, n_segments=1000, compactness=10)
+        for seg_id in np.unique(segments):
+            mask = (segments == seg_id)
+            avg_color = (*np.mean(image[mask], axis=0).astype(int), 200)
+            for y, x in np.argwhere(mask)[::20]:
+                size, opacity = depth_modulators(depth_map[y, x] if depth_map is not None else 0.5)
+                draw_brush_stroke(shader_draw, vao_brush, (x, y), 15*size, (*avg_color[:3], avg_color[3]*opacity), proj_matrix)
+            yield
+
+        # Phase 2: Character
+        print("Painting Character...")
+        char_mask = create_character_mask(image_paths["person"], image_paths["background"], (img_w, img_h))
+        if char_mask is not None:
+            person_image = cv2.cvtColor(cv2.imread(image_paths["person"]), cv2.COLOR_BGR2RGB)
+            person_depth = load_depth_map(image_paths["person_depth"], (img_w, img_h))
+            person_segments = segmentation.slic(person_image, n_segments=800, compactness=10)
+            for seg_id in np.unique(person_segments):
+                mask = (person_segments == seg_id) & (char_mask > 0)
+                if not np.any(mask): continue
+                avg_color = (*np.mean(person_image[mask], axis=0).astype(int), 220)
+                for y, x in np.argwhere(mask)[::15]:
+                    size, opacity = depth_modulators(person_depth[y, x] if person_depth is not None else 0.8)
+                    draw_brush_stroke(shader_draw, vao_brush, (x, y), 10*size, (*avg_color[:3], avg_color[3]*opacity), proj_matrix)
+                yield
+
+    print("Painting complete!")
+
 def main():
-    image_paths = select_image_paths()
+    mode = select_mode()
+    if not mode in ['simple', 'advanced']:
+        print("Invalid mode selected. Exiting.")
+        return
+
+    image_paths = select_image_paths(mode)
     if not image_paths: return
 
-    img_ref = cv2.imread(image_paths["background"])
+    img_ref = cv2.imread(image_paths["original"] if mode == 'simple' else image_paths["background"])
     img_h, img_w = img_ref.shape[:2]
 
     pygame.init()
@@ -154,47 +212,25 @@ def main():
 
     proj_matrix = np.array([[2.0/img_w,0,0,0], [0,-2.0/img_h,0,0], [0,0,-1,0], [-1,1,0,1]], dtype=np.float32)
 
-    # --- Painting Process (runs once) ---
+    painter = painting_generator(mode, image_paths, shader_draw, vao_brush, proj_matrix, img_w, img_h)
+
     glBindFramebuffer(GL_FRAMEBUFFER, fbo)
     glClearColor(1, 1, 1, 1)
     glClear(GL_COLOR_BUFFER_BIT)
-
-    # Phase 1: Background
-    print("Painting Background...")
-    image = cv2.cvtColor(img_ref, cv2.COLOR_BGR2RGB)
-    depth_map = load_depth_map(image_paths["background_depth"], (img_w, img_h))
-    segments = segmentation.slic(image, n_segments=1000, compactness=10)
-    for seg_id in np.unique(segments):
-        mask = (segments == seg_id)
-        avg_color = (*np.mean(image[mask], axis=0).astype(int), 200)
-        for y, x in np.argwhere(mask)[::20]:
-            size, opacity = depth_modulators(depth_map[y, x] if depth_map is not None else 0.5)
-            draw_brush_stroke(shader_draw, vao_brush, (x, y), 15*size, (*avg_color[:3], avg_color[3]*opacity), proj_matrix)
-
-    # Phase 2: Character
-    print("Painting Character...")
-    char_mask = create_character_mask(image_paths["person"], image_paths["background"], (img_w, img_h))
-    if char_mask is not None:
-        person_image = cv2.cvtColor(cv2.imread(image_paths["person"]), cv2.COLOR_BGR2RGB)
-        person_depth = load_depth_map(image_paths["person_depth"], (img_w, img_h))
-        person_segments = segmentation.slic(person_image, n_segments=800, compactness=10)
-        for seg_id in np.unique(person_segments):
-            mask = (person_segments == seg_id) & (char_mask > 0)
-            if not np.any(mask): continue
-            avg_color = (*np.mean(person_image[mask], axis=0).astype(int), 220)
-            for y, x in np.argwhere(mask)[::15]:
-                size, opacity = depth_modulators(person_depth[y, x] if person_depth is not None else 0.8)
-                draw_brush_stroke(shader_draw, vao_brush, (x, y), 10*size, (*avg_color[:3], avg_color[3]*opacity), proj_matrix)
-
     glBindFramebuffer(GL_FRAMEBUFFER, 0)
-    print("Painting complete!")
 
-    # --- Main Loop ---
     running = True
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo)
+        try:
+            next(painter)
+        except StopIteration:
+            pass
+        glBindFramebuffer(GL_FRAMEBUFFER, 0)
 
         glClearColor(0,0,0,1)
         glClear(GL_COLOR_BUFFER_BIT)
@@ -203,6 +239,7 @@ def main():
         glBindTexture(GL_TEXTURE_2D, canvas_texture)
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
         pygame.display.flip()
+        pygame.time.wait(10)
 
     pygame.quit()
 
