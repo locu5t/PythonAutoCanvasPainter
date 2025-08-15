@@ -1,5 +1,4 @@
 pygame
-PyOpenGL
 numpy
 scikit-image
 opencv-python
